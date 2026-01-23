@@ -42,17 +42,8 @@ def graphql_request(query: str, variables: Optional[dict] = None) -> dict:
     return result.get("data", {})
 
 
-@mcp.tool()
-def get_issue(identifier: str) -> dict:
-    """
-    Get a Linear issue by its identifier (e.g., 'SRE-152').
-
-    Args:
-        identifier: The issue identifier like 'SRE-152' or 'ENG-123'
-
-    Returns:
-        Issue details including title, description, status, assignee, labels, and comments
-    """
+def _get_issue_internal(identifier: str) -> dict:
+    """Internal helper to get issue - can be called by other functions."""
     query = """
     query GetIssue($term: String!) {
       searchIssues(term: $term, first: 1) {
@@ -120,6 +111,20 @@ def get_issue(identifier: str) -> dict:
 
     # Return first result if no exact match
     return issues[0]
+
+
+@mcp.tool()
+def get_issue(identifier: str) -> dict:
+    """
+    Get a Linear issue by its identifier (e.g., 'SRE-152').
+
+    Args:
+        identifier: The issue identifier like 'SRE-152' or 'ENG-123'
+
+    Returns:
+        Issue details including title, description, status, assignee, labels, and comments
+    """
+    return _get_issue_internal(identifier)
 
 
 @mcp.tool()
@@ -261,7 +266,7 @@ def update_issue_status(identifier: str, state_name: str) -> dict:
         Updated issue details
     """
     # First, get the issue to find its ID and team
-    issue = get_issue(identifier)
+    issue = _get_issue_internal(identifier)
     if "error" in issue:
         return issue
 
@@ -330,7 +335,7 @@ def add_comment(identifier: str, body: str) -> dict:
         Created comment details
     """
     # Get the issue ID
-    issue = get_issue(identifier)
+    issue = _get_issue_internal(identifier)
     if "error" in issue:
         return issue
 
@@ -377,7 +382,7 @@ def update_issue(
         Updated issue details
     """
     # Get the issue ID
-    issue = get_issue(identifier)
+    issue = _get_issue_internal(identifier)
     if "error" in issue:
         return issue
 
