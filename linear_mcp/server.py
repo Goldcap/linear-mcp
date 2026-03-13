@@ -13,17 +13,98 @@ LINEAR_API_URL = "https://api.linear.app/graphql"
 mcp = FastMCP("linear-mcp")
 
 
-def get_api_key() -> str:
-    """Get Linear API key from environment."""
-    key = os.environ.get("LINEAR_API_KEY")
-    if not key:
-        raise ValueError("LINEAR_API_KEY environment variable not set")
-    return key
+def get_available_organizations() -> dict[str, str]:
+    """
+    Get all configured Linear organizations and their API keys.
+
+    Supports two configuration formats:
+    1. Single key: LINEAR_API_KEY (default organization)
+    2. Multiple keys: LINEAR_API_KEY_ORGNAME (e.g., LINEAR_API_KEY_APPSUMO)
+
+    Returns:
+        Dictionary mapping organization names (lowercase) to API keys
+    """
+    orgs = {}
+
+    # Check for default single API key
+    default_key = os.environ.get("LINEAR_API_KEY")
+    if default_key:
+        orgs["default"] = default_key
+
+    # Check for organization-specific keys
+    for key, value in os.environ.items():
+        if key.startswith("LINEAR_API_KEY_") and value:
+            org_name = key.replace("LINEAR_API_KEY_", "").lower()
+            orgs[org_name] = value
+
+    return orgs
 
 
-def graphql_request(query: str, variables: Optional[dict] = None) -> dict:
-    """Execute a GraphQL request against Linear API."""
-    api_key = get_api_key()
+def get_api_key(organization: Optional[str] = None) -> str:
+    """
+    Get Linear API key for a specific organization.
+
+    Args:
+        organization: Organization name (case-insensitive). If None, uses default.
+
+    Returns:
+        API key for the specified organization
+
+    Raises:
+        ValueError: If no API keys configured or organization not found
+    """
+    orgs = get_available_organizations()
+
+    if not orgs:
+        raise ValueError(
+            "No Linear API keys configured. Set LINEAR_API_KEY or LINEAR_API_KEY_ORGNAME environment variables"
+        )
+
+    # If no organization specified, use default or first available
+    if not organization:
+        if "default" in orgs:
+            return orgs["default"]
+        # Return first available organization
+        return next(iter(orgs.values()))
+
+    # Normalize organization name for matching
+    org_normalized = organization.lower().replace(" ", "").replace("-", "")
+
+    # Try exact match first
+    if org_normalized in orgs:
+        return orgs[org_normalized]
+
+    # Try partial match (e.g., "appsumo" matches "appsumo-production")
+    for org_key, api_key in orgs.items():
+        org_key_normalized = org_key.replace(" ", "").replace("-", "")
+        if org_normalized in org_key_normalized or org_key_normalized in org_normalized:
+            return api_key
+
+    # No match found
+    available = [name for name in orgs.keys() if name != "default"]
+    if available:
+        raise ValueError(
+            f"Organization '{organization}' not found. Available organizations: {', '.join(available)}"
+        )
+    else:
+        raise ValueError(
+            f"Organization '{organization}' not found. Only default organization is configured."
+        )
+
+
+def graphql_request(query: str, variables: Optional[dict] = None, organization: Optional[str] = None) -> dict:
+    """
+    Execute a GraphQL request against Linear API.
+
+    Args:
+        query: GraphQL query string
+        variables: Optional query variables
+        organization: Organization name to use (uses default if not specified)
+
+    Returns:
+        GraphQL response data
+    """
+    api_key = get_api_key(organization)
     headers = {
         "Authorization": api_key,
         "Content-Type": "application/json",
@@ -42,8 +123,17 @@ def graphql_request(query: str, variables: Optional[dict] = None) -> dict:
     return result.get("data", {})
 
 
-def _get_issue_internal(identifier: str) -> dict:
-    """Internal helper to get issue - can be called by other functions."""
+def _get_issue_internal(identifier: str, organization: Optional[str] = None) -> dict:
+    """
+    Internal helper to get issue - can be called by other functions.
+
+    Args:
+        identifier: Issue identifier (e.g., 'SRE-152')
+        organization: Organization name to use
+
+    Returns:
+        Issue details dictionary
+    """
     query = """
     query GetIssue($term: String!) {
       searchIssues(term: $term, first: 1) {
@@ -98,7 +188,7 @@ def _get_issue_internal(identifier: str) -> dict:
     }
     """
     variables = {"term": identifier}
-    data = graphql_request(query, variables)
+    data = graphql_request(query, variables, organization=organization)
 
     issues = data.get("searchIssues", {}).get("nodes", [])
     if not issues:
@@ -114,17 +204,18 @@ def _get_issue_internal(identifier: str) -> dict:
 
 
 @mcp.tool()
-def get_issue(identifier: str) -> dict:
+def get_issue(identifier: str, organization: Optional[str] = None) -> dict:
     """
     Get a Linear issue by its identifier (e.g., 'SRE-152').
 
     Args:
         identifier: The issue identifier like 'SRE-152' or 'ENG-123'
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         Issue details including title, description, status, assignee, labels, and comments
     """
-    return _get_issue_internal(identifier)
+    return _get_issue_internal(identifier, organization=organization)
 
 
 @mcp.tool()
@@ -134,6 +225,7 @@ def search_issues(
     state_name: Optional[str] = None,
     assignee_email: Optional[str] = None,
     limit: int = 20,
+    organization: Optional[str] = None,
 ) -> dict:
     """
     Search for Linear issues with optional filters.
@@ -144,6 +236,7 @@ def search_issues(
         state_name: Filter by state name (e.g., 'Todo', 'In Progress', 'Done')
         assignee_email: Filter by assignee email
         limit: Maximum number of results (default 20, max 50)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         List of matching issues with basic details
@@ -188,7 +281,7 @@ def search_issues(
         }}
         """
         variables = {"term": query, "limit": min(limit, 50)}
-        data = graphql_request(gql_query, variables)
+        data = graphql_request(gql_query, variables, organization=organization)
         return {"issues": data.get("searchIssues", {}).get("nodes", [])}
     else:
         # No search query, just filter
@@ -218,14 +311,17 @@ def search_issues(
         }}
         """
         variables = {"limit": min(limit, 50)}
-        data = graphql_request(gql_query, variables)
+        data = graphql_request(gql_query, variables, organization=organization)
         return {"issues": data.get("issues", {}).get("nodes", [])}
 
 
 @mcp.tool()
-def list_teams() -> dict:
+def list_teams(organization: Optional[str] = None) -> dict:
     """
     List all teams with their workflow states.
+
+    Args:
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         List of teams with their IDs, keys, names, and available workflow states
@@ -249,24 +345,25 @@ def list_teams() -> dict:
       }
     }
     """
-    data = graphql_request(query)
+    data = graphql_request(query, organization=organization)
     return {"teams": data.get("teams", {}).get("nodes", [])}
 
 
 @mcp.tool()
-def update_issue_status(identifier: str, state_name: str) -> dict:
+def update_issue_status(identifier: str, state_name: str, organization: Optional[str] = None) -> dict:
     """
     Update an issue's workflow status.
 
     Args:
         identifier: The issue identifier (e.g., 'SRE-152')
         state_name: The target state name (e.g., 'In Progress', 'Done', 'Todo')
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         Updated issue details
     """
     # First, get the issue to find its ID and team
-    issue = _get_issue_internal(identifier)
+    issue = _get_issue_internal(identifier, organization=organization)
     if "error" in issue:
         return issue
 
@@ -287,7 +384,7 @@ def update_issue_status(identifier: str, state_name: str) -> dict:
       }
     }
     """
-    states_data = graphql_request(states_query, {"teamId": team_id})
+    states_data = graphql_request(states_query, {"teamId": team_id}, organization=organization)
     states = states_data.get("team", {}).get("states", {}).get("nodes", [])
 
     # Find matching state (case-insensitive)
@@ -318,24 +415,25 @@ def update_issue_status(identifier: str, state_name: str) -> dict:
       }
     }
     """
-    result = graphql_request(mutation, {"issueId": issue_id, "stateId": target_state["id"]})
+    result = graphql_request(mutation, {"issueId": issue_id, "stateId": target_state["id"]}, organization=organization)
     return result.get("issueUpdate", {})
 
 
 @mcp.tool()
-def add_comment(identifier: str, body: str) -> dict:
+def add_comment(identifier: str, body: str, organization: Optional[str] = None) -> dict:
     """
     Add a comment to an issue.
 
     Args:
         identifier: The issue identifier (e.g., 'SRE-152')
         body: The comment text (supports markdown)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         Created comment details
     """
     # Get the issue ID
-    issue = _get_issue_internal(identifier)
+    issue = _get_issue_internal(identifier, organization=organization)
     if "error" in issue:
         return issue
 
@@ -356,7 +454,7 @@ def add_comment(identifier: str, body: str) -> dict:
       }
     }
     """
-    result = graphql_request(mutation, {"issueId": issue_id, "body": body})
+    result = graphql_request(mutation, {"issueId": issue_id, "body": body}, organization=organization)
     return result.get("commentCreate", {})
 
 
@@ -367,6 +465,7 @@ def update_issue(
     description: Optional[str] = None,
     priority: Optional[int] = None,
     assignee_email: Optional[str] = None,
+    organization: Optional[str] = None,
 ) -> dict:
     """
     Update issue fields (title, description, priority, assignee).
@@ -377,12 +476,13 @@ def update_issue(
         description: New description (optional, supports markdown)
         priority: New priority 0-4 where 0=none, 1=urgent, 2=high, 3=medium, 4=low (optional)
         assignee_email: Email of user to assign (optional)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
         Updated issue details
     """
     # Get the issue ID
-    issue = _get_issue_internal(identifier)
+    issue = _get_issue_internal(identifier, organization=organization)
     if "error" in issue:
         return issue
 
@@ -416,7 +516,7 @@ def update_issue(
           }
         }
         """
-        user_data = graphql_request(user_query, {"email": assignee_email})
+        user_data = graphql_request(user_query, {"email": assignee_email}, organization=organization)
         users = user_data.get("users", {}).get("nodes", [])
         if not users:
             return {"error": f"User with email '{assignee_email}' not found"}
@@ -459,8 +559,175 @@ def update_issue(
       }}
     }}
     """
-    result = graphql_request(mutation, variables)
+    result = graphql_request(mutation, variables, organization=organization)
     return result.get("issueUpdate", {})
+
+
+@mcp.tool()
+def create_issue(
+    title: str,
+    team_key: str,
+    description: Optional[str] = None,
+    priority: Optional[int] = None,
+    state_name: Optional[str] = None,
+    assignee_email: Optional[str] = None,
+    organization: Optional[str] = None,
+) -> dict:
+    """
+    Create a new Linear issue.
+
+    Args:
+        title: Issue title
+        team_key: Team key (e.g., 'SRE', 'ENG')
+        description: Issue description (optional, supports markdown)
+        priority: Priority 0-4 where 0=none, 1=urgent, 2=high, 3=medium, 4=low (optional)
+        state_name: Initial state name (e.g., 'Todo', 'Backlog'). Optional, uses team default if not specified.
+        assignee_email: Email of user to assign (optional)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
+
+    Returns:
+        Created issue details
+    """
+    # Get the team to find its ID
+    teams_query = """
+    query GetTeams {
+      teams {
+        nodes {
+          id
+          key
+          states {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+    """
+    teams_data = graphql_request(teams_query, organization=organization)
+    teams = teams_data.get("teams", {}).get("nodes", [])
+
+    # Find the team
+    target_team = None
+    for team in teams:
+        if team["key"].lower() == team_key.lower():
+            target_team = team
+            break
+
+    if not target_team:
+        available = [t["key"] for t in teams]
+        return {"error": f"Team '{team_key}' not found. Available teams: {available}"}
+
+    team_id = target_team["id"]
+
+    # Build input object
+    input_fields = ["title: $title", "teamId: $teamId"]
+    variables = {"title": title, "teamId": team_id}
+
+    if description is not None:
+        input_fields.append("description: $description")
+        variables["description"] = description
+
+    if priority is not None:
+        input_fields.append("priority: $priority")
+        variables["priority"] = priority
+
+    # Handle state lookup
+    if state_name is not None:
+        states = target_team.get("states", {}).get("nodes", [])
+        target_state = None
+        for state in states:
+            if state["name"].lower() == state_name.lower():
+                target_state = state
+                break
+
+        if not target_state:
+            available = [s["name"] for s in states]
+            return {"error": f"State '{state_name}' not found. Available states: {available}"}
+
+        input_fields.append("stateId: $stateId")
+        variables["stateId"] = target_state["id"]
+
+    # Handle assignee lookup
+    if assignee_email is not None:
+        user_query = """
+        query FindUser($email: String!) {
+          users(filter: { email: { eq: $email } }) {
+            nodes {
+              id
+              name
+              email
+            }
+          }
+        }
+        """
+        user_data = graphql_request(user_query, {"email": assignee_email}, organization=organization)
+        users = user_data.get("users", {}).get("nodes", [])
+        if not users:
+            return {"error": f"User with email '{assignee_email}' not found"}
+        input_fields.append("assigneeId: $assigneeId")
+        variables["assigneeId"] = users[0]["id"]
+
+    # Build variable declarations
+    var_decls = ["$title: String!", "$teamId: String!"]
+    if "description" in variables:
+        var_decls.append("$description: String")
+    if "priority" in variables:
+        var_decls.append("$priority: Int")
+    if "stateId" in variables:
+        var_decls.append("$stateId: String")
+    if "assigneeId" in variables:
+        var_decls.append("$assigneeId: String")
+
+    mutation = f"""
+    mutation CreateIssue({", ".join(var_decls)}) {{
+      issueCreate(input: {{ {", ".join(input_fields)} }}) {{
+        success
+        issue {{
+          id
+          identifier
+          title
+          description
+          priority
+          priorityLabel
+          url
+          state {{
+            name
+            type
+          }}
+          assignee {{
+            name
+            email
+          }}
+          team {{
+            key
+            name
+          }}
+        }}
+      }}
+    }}
+    """
+    result = graphql_request(mutation, variables, organization=organization)
+    return result.get("issueCreate", {})
+
+
+@mcp.tool()
+def list_organizations() -> dict:
+    """
+    List all configured Linear organizations.
+
+    Returns:
+        List of organization names that can be used in other tool calls
+    """
+    orgs = get_available_organizations()
+    org_names = [name for name in orgs.keys() if name != "default"]
+
+    return {
+        "organizations": org_names,
+        "has_default": "default" in orgs,
+        "count": len(org_names),
+    }
 
 
 def main():
