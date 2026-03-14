@@ -571,6 +571,7 @@ def create_issue(
     priority: Optional[int] = None,
     state_name: Optional[str] = None,
     assignee_email: Optional[str] = None,
+    project_name: Optional[str] = None,
     organization: Optional[str] = None,
 ) -> dict:
     """
@@ -583,6 +584,7 @@ def create_issue(
         priority: Priority 0-4 where 0=none, 1=urgent, 2=high, 3=medium, 4=low (optional)
         state_name: Initial state name (e.g., 'Todo', 'Backlog'). Optional, uses team default if not specified.
         assignee_email: Email of user to assign (optional)
+        project_name: Project name to add issue to (optional, case-insensitive match)
         organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
@@ -669,6 +671,31 @@ def create_issue(
         input_fields.append("assigneeId: $assigneeId")
         variables["assigneeId"] = users[0]["id"]
 
+    # Handle project lookup
+    if project_name is not None:
+        projects_query = """
+        query ListProjects {
+          projects(first: 50) {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+        """
+        projects_data = graphql_request(projects_query, organization=organization)
+        projects = projects_data.get("projects", {}).get("nodes", [])
+        target_project = None
+        for project in projects:
+            if project["name"].lower() == project_name.lower():
+                target_project = project
+                break
+        if not target_project:
+            available = [p["name"] for p in projects]
+            return {"error": f"Project '{project_name}' not found. Available projects: {available}"}
+        input_fields.append("projectId: $projectId")
+        variables["projectId"] = target_project["id"]
+
     # Build variable declarations
     var_decls = ["$title: String!", "$teamId: String!"]
     if "description" in variables:
@@ -679,6 +706,8 @@ def create_issue(
         var_decls.append("$stateId: String")
     if "assigneeId" in variables:
         var_decls.append("$assigneeId: String")
+    if "projectId" in variables:
+        var_decls.append("$projectId: String")
 
     mutation = f"""
     mutation CreateIssue({", ".join(var_decls)}) {{
@@ -710,6 +739,131 @@ def create_issue(
     """
     result = graphql_request(mutation, variables, organization=organization)
     return result.get("issueCreate", {})
+
+
+@mcp.tool()
+def create_project(
+    name: str,
+    team_key: str,
+    description: Optional[str] = None,
+    organization: Optional[str] = None,
+) -> dict:
+    """
+    Create a new Linear project.
+
+    Args:
+        name: Project name
+        team_key: Team key (e.g., 'SRE', 'ENG') to associate the project with
+        description: Project description (optional, supports markdown)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
+
+    Returns:
+        Created project details
+    """
+    # Get team ID
+    teams_query = """
+    query GetTeams {
+      teams {
+        nodes {
+          id
+          key
+          name
+        }
+      }
+    }
+    """
+    teams_data = graphql_request(teams_query, organization=organization)
+    teams = teams_data.get("teams", {}).get("nodes", [])
+
+    target_team = None
+    for team in teams:
+        if team["key"].lower() == team_key.lower():
+            target_team = team
+            break
+
+    if not target_team:
+        available = [t["key"] for t in teams]
+        return {"error": f"Team '{team_key}' not found. Available teams: {available}"}
+
+    # Build mutation
+    input_fields = ["name: $name", "teamIds: [$teamId]"]
+    variables = {"name": name, "teamId": target_team["id"]}
+    var_decls = ["$name: String!", "$teamId: String!"]
+
+    if description is not None:
+        input_fields.append("description: $description")
+        variables["description"] = description
+        var_decls.append("$description: String")
+
+    mutation = f"""
+    mutation CreateProject({", ".join(var_decls)}) {{
+      projectCreate(input: {{ {", ".join(input_fields)} }}) {{
+        success
+        project {{
+          id
+          name
+          description
+          url
+          state
+          teams {{
+            nodes {{
+              key
+              name
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    result = graphql_request(mutation, variables, organization=organization)
+    return result.get("projectCreate", {})
+
+
+@mcp.tool()
+def list_projects(
+    team_key: Optional[str] = None,
+    organization: Optional[str] = None,
+) -> dict:
+    """
+    List Linear projects, optionally filtered by team.
+
+    Args:
+        team_key: Filter by team key (e.g., 'SRE', 'ENG'). Optional.
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
+
+    Returns:
+        List of projects with details
+    """
+    query = """
+    query ListProjects {
+      projects(first: 50) {
+        nodes {
+          id
+          name
+          description
+          url
+          state
+          teams {
+            nodes {
+              key
+              name
+            }
+          }
+        }
+      }
+    }
+    """
+    data = graphql_request(query, organization=organization)
+    projects = data.get("projects", {}).get("nodes", [])
+
+    # Filter by team if specified
+    if team_key:
+        projects = [
+            p for p in projects
+            if any(t["key"].lower() == team_key.lower() for t in p.get("teams", {}).get("nodes", []))
+        ]
+
+    return {"projects": projects}
 
 
 @mcp.tool()
