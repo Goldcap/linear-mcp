@@ -2,13 +2,24 @@
 """Linear MCP Server - Simple Linear issue management via GraphQL API."""
 
 import os
+import sys
 import json
+import logging
 from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
 
 LINEAR_API_URL = "https://api.linear.app/graphql"
+
+# Log to stderr so messages show up in Claude Code's MCP server logs
+# (~/.cache/claude-cli-nodejs/.../mcp-logs-linear/ and `claude --debug`).
+logging.basicConfig(
+    level=os.environ.get("LINEAR_MCP_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [linear-mcp] %(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("linear-mcp")
 
 mcp = FastMCP("linear-mcp")
 
@@ -37,6 +48,7 @@ def get_available_organizations() -> dict[str, str]:
             org_name = key.replace("LINEAR_API_KEY_", "").lower()
             orgs[org_name] = value
 
+    logger.debug("Configured organizations: %s", list(orgs.keys()))
     return orgs
 
 
@@ -113,11 +125,23 @@ def graphql_request(query: str, variables: Optional[dict] = None, organization: 
     if variables:
         payload["variables"] = variables
 
-    response = httpx.post(LINEAR_API_URL, headers=headers, json=payload, timeout=30.0)
-    response.raise_for_status()
+    op = (query.strip().split("{", 1)[0] or "query").strip()
+    logger.info("GraphQL request: %s (org=%s)", op, organization or "default")
+
+    try:
+        response = httpx.post(LINEAR_API_URL, headers=headers, json=payload, timeout=30.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.error("Linear API HTTP %s: %s", e.response.status_code, e.response.text[:500])
+        raise
+    except httpx.HTTPError as e:
+        logger.error("Linear API request failed: %s", e)
+        raise
+
     result = response.json()
 
     if "errors" in result:
+        logger.error("GraphQL errors: %s", json.dumps(result["errors"]))
         raise Exception(f"GraphQL errors: {json.dumps(result['errors'], indent=2)}")
 
     return result.get("data", {})
@@ -886,6 +910,14 @@ def list_organizations() -> dict:
 
 def main():
     """Run the MCP server."""
+    orgs = get_available_organizations()
+    if not orgs:
+        logger.warning(
+            "Starting with NO Linear API keys configured. "
+            "Set LINEAR_API_KEY (or LINEAR_API_KEY_ORGNAME) in the MCP server env."
+        )
+    else:
+        logger.info("Starting linear-mcp. Organizations: %s", list(orgs.keys()))
     mcp.run()
 
 
