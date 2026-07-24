@@ -8,6 +8,13 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.optional-dependencies]
+# OS keyring resolution for API keys. Optional: environment variables and
+# _CMD helper commands work without it.
+keyring = [
+    "keyring>=24.0.0",
+]
+
 [project.scripts]
 linear-mcp = "linear_mcp.server:main"
 

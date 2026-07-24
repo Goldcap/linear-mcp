@@ -88,11 +88,77 @@ You can also mix both formats:
 }
 ```
 
+### Keeping keys out of the config file
+
+Every `LINEAR_API_KEY*` variable above can be supplied three ways. The first
+one that yields a value wins:
+
+| Order | Source | Config holds |
+|---|---|---|
+| 1 | The variable itself, e.g. `LINEAR_API_KEY_KOARD` | the key |
+| 2 | A helper command, `LINEAR_API_KEY_KOARD_CMD` | a command |
+| 3 | The OS keyring, service `linear-mcp`, username `LINEAR_API_KEY_KOARD` | nothing |
+
+**Helper commands** are the recommended option. The command's stdout (stripped)
+becomes the key, so the secret is never written to the config file *and* never
+enters the process environment — it exists only in the server's memory. Only the
+command shows up in `/proc/<pid>/environ`.
+
+```json
+{
+  "mcpServers": {
+    "linear": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/Goldcap/linear-mcp.git", "linear-mcp"],
+      "env": {
+        "LINEAR_API_KEY_APPSUMO_CMD": "secret-tool lookup service linear-mcp account appsumo",
+        "LINEAR_API_KEY_KOARD_CMD":   "secret-tool lookup service linear-mcp account koard"
+      }
+    }
+  }
+}
+```
+
+Store the keys once with libsecret (GNOME Keyring, KDE Wallet):
+
+```bash
+secret-tool store --label='Linear MCP (koard)' service linear-mcp account koard
+```
+
+Any command works — `pass show linear/koard`, `op read op://Private/Linear/credential`,
+or, if you want an audit trail on every secret read:
+
+```bash
+aws ssm get-parameter --name /koard/linear/api-key --with-decryption \
+  --query Parameter.Value --output text
+```
+
+**OS keyring** (option 3) needs the optional dependency:
+
+```bash
+uvx --from "git+https://github.com/Goldcap/linear-mcp.git[keyring]" linear-mcp
+keyring set linear-mcp LINEAR_API_KEY_KOARD
+```
+
+Notes:
+
+- Helper commands run through the shell, so pipes and redirection work. They are
+  your own config, but treat the string as executed code.
+- Resolution is cached per process — a rotated key needs a server restart.
+- A helper that fails or prints nothing logs to stderr and that organization is
+  skipped; other organizations still load.
+- Plain environment variables keep working unchanged, which is usually what you
+  want in CI.
+
 ## Getting a Linear API Key
 
 1. Go to Linear Settings → API → Personal API keys
 2. Create a new API key with appropriate scopes
 3. Copy the key (starts with `lin_api_`)
+
+Note that a personal API key is a long-lived shared credential however it is
+stored. The options above reduce where it sits at rest; they do not make it
+expire.
 
 ## Usage Examples
 

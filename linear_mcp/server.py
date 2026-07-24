@@ -5,12 +5,19 @@ import os
 import sys
 import json
 import logging
+import subprocess
+from functools import lru_cache
 from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
 
 LINEAR_API_URL = "https://api.linear.app/graphql"
+
+KEY_PREFIX = "LINEAR_API_KEY"
+CMD_SUFFIX = "_CMD"
+KEYRING_SERVICE = "linear-mcp"
+HELPER_TIMEOUT = 15
 
 # Log to stderr so messages show up in Claude Code's MCP server logs
 # (~/.cache/claude-cli-nodejs/.../mcp-logs-linear/ and `claude --debug`).
@@ -24,6 +31,85 @@ logger = logging.getLogger("linear-mcp")
 mcp = FastMCP("linear-mcp")
 
 
+@lru_cache(maxsize=None)
+def resolve_secret(var_name: str) -> Optional[str]:
+    """
+    Resolve one API key without requiring it to sit in plaintext config.
+
+    Resolution order, first hit wins:
+      1. The literal environment variable (VAR) — simplest, and what CI uses.
+      2. A helper command (VAR_CMD) whose stdout is the secret. The secret
+         itself never enters the environment, so it does not show up in
+         /proc/<pid>/environ; only the command does.
+      3. The OS keyring, under service "linear-mcp" with VAR as the username.
+
+    Results are cached for the life of the process, so a rotated secret
+    needs a server restart to take effect.
+    """
+    literal = os.environ.get(var_name)
+    if literal:
+        return literal
+
+    helper = os.environ.get(f"{var_name}{CMD_SUFFIX}")
+    if helper:
+        try:
+            result = subprocess.run(
+                helper,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=HELPER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "%s%s timed out after %ss", var_name, CMD_SUFFIX, HELPER_TIMEOUT
+            )
+            return None
+        except subprocess.CalledProcessError as exc:
+            # exc.stderr may carry detail from the helper, but never the secret,
+            # which the helper writes to stdout.
+            logger.error(
+                "%s%s exited %s%s",
+                var_name,
+                CMD_SUFFIX,
+                exc.returncode,
+                f": {exc.stderr.strip()}" if (exc.stderr or "").strip() else "",
+            )
+            return None
+        secret = result.stdout.strip()
+        if secret:
+            logger.debug("%s resolved via %s%s", var_name, var_name, CMD_SUFFIX)
+            return secret
+        logger.error("%s%s produced no output", var_name, CMD_SUFFIX)
+        return None
+
+    try:
+        import keyring
+    except ImportError:
+        logger.debug("keyring not installed; no source left for %s", var_name)
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, var_name)
+    except Exception as exc:
+        logger.error("keyring lookup for %s failed: %s", var_name, exc)
+        return None
+
+
+def _configured_var_names() -> set[str]:
+    """
+    Every LINEAR_API_KEY* variable name the environment refers to, with any
+    _CMD suffix stripped. LINEAR_API_KEY is always considered so that a
+    keyring-only default still resolves.
+    """
+    names = {KEY_PREFIX}
+    for key in os.environ:
+        if not key.startswith(KEY_PREFIX):
+            continue
+        names.add(key[: -len(CMD_SUFFIX)] if key.endswith(CMD_SUFFIX) else key)
+    return names
+
+
 def get_available_organizations() -> dict[str, str]:
     """
     Get all configured Linear organizations and their API keys.
@@ -32,21 +118,22 @@ def get_available_organizations() -> dict[str, str]:
     1. Single key: LINEAR_API_KEY (default organization)
     2. Multiple keys: LINEAR_API_KEY_ORGNAME (e.g., LINEAR_API_KEY_APPSUMO)
 
+    Each of those may be supplied directly, as a VAR_CMD helper command, or
+    from the OS keyring — see resolve_secret().
+
     Returns:
         Dictionary mapping organization names (lowercase) to API keys
     """
     orgs = {}
 
-    # Check for default single API key
-    default_key = os.environ.get("LINEAR_API_KEY")
-    if default_key:
-        orgs["default"] = default_key
-
-    # Check for organization-specific keys
-    for key, value in os.environ.items():
-        if key.startswith("LINEAR_API_KEY_") and value:
-            org_name = key.replace("LINEAR_API_KEY_", "").lower()
-            orgs[org_name] = value
+    for var_name in sorted(_configured_var_names()):
+        value = resolve_secret(var_name)
+        if not value:
+            continue
+        if var_name == KEY_PREFIX:
+            orgs["default"] = value
+        else:
+            orgs[var_name[len(KEY_PREFIX) + 1 :].lower()] = value
 
     logger.debug("Configured organizations: %s", list(orgs.keys()))
     return orgs
@@ -69,7 +156,9 @@ def get_api_key(organization: Optional[str] = None) -> str:
 
     if not orgs:
         raise ValueError(
-            "No Linear API keys configured. Set LINEAR_API_KEY or LINEAR_API_KEY_ORGNAME environment variables"
+            "No Linear API keys configured. Set LINEAR_API_KEY or LINEAR_API_KEY_ORGNAME "
+            "directly, point LINEAR_API_KEY[_ORGNAME]_CMD at a command that prints the key, "
+            f"or store it in the OS keyring under service '{KEYRING_SERVICE}'"
         )
 
     # If no organization specified, use default or first available
