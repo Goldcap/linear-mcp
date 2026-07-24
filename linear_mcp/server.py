@@ -316,6 +316,127 @@ def _get_issue_internal(identifier: str, organization: Optional[str] = None) -> 
     return issues[0]
 
 
+def _resolve_label_ids(
+    label_names: list[str],
+    team_id: str,
+    organization: Optional[str] = None,
+    create_missing: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    Map label names to Linear label IDs.
+
+    Matching is case-insensitive. Where a team-scoped label and a workspace
+    label share a name, the one belonging to team_id wins, since that is what
+    the Linear UI would apply to an issue on that team.
+
+    Labels are never created unless create_missing is explicitly set, so a typo
+    produces an error rather than a new label nobody meant to add.
+
+    Returns:
+        (matched_ids, unmatched_names)
+    """
+    query = """
+    query ListLabels {
+      issueLabels(first: 250) {
+        nodes {
+          id
+          name
+          team { id }
+        }
+      }
+    }
+    """
+    data = graphql_request(query, organization=organization)
+    nodes = data.get("issueLabels", {}).get("nodes", [])
+
+    by_name: dict[str, dict] = {}
+    for node in nodes:
+        key = node["name"].strip().lower()
+        if key not in by_name or (node.get("team") or {}).get("id") == team_id:
+            by_name[key] = node
+
+    ids: list[str] = []
+    unmatched: list[str] = []
+    for name in label_names:
+        match = by_name.get(name.strip().lower())
+        if match:
+            ids.append(match["id"])
+            continue
+        if not create_missing:
+            unmatched.append(name)
+            continue
+        created = graphql_request(
+            """
+            mutation CreateLabel($name: String!, $teamId: String!) {
+              issueLabelCreate(input: { name: $name, teamId: $teamId }) {
+                success
+                issueLabel { id name }
+              }
+            }
+            """,
+            {"name": name, "teamId": team_id},
+            organization=organization,
+        )
+        payload = created.get("issueLabelCreate", {})
+        if payload.get("success") and payload.get("issueLabel"):
+            logger.info("Created label %r on team %s", name, team_id)
+            ids.append(payload["issueLabel"]["id"])
+        else:
+            unmatched.append(name)
+
+    return ids, unmatched
+
+
+@mcp.tool()
+def list_labels(team_key: Optional[str] = None, organization: Optional[str] = None) -> dict:
+    """
+    List available issue labels.
+
+    Args:
+        team_key: Filter to labels usable by this team, i.e. that team's own
+            labels plus workspace-wide ones (optional)
+        organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
+
+    Returns:
+        Labels with their names, IDs, owning team key (null for workspace-wide
+        labels), and parent group where the label belongs to one
+    """
+    query = """
+    query ListLabels {
+      issueLabels(first: 250) {
+        nodes {
+          id
+          name
+          team { key }
+          parent { name }
+        }
+      }
+    }
+    """
+    data = graphql_request(query, organization=organization)
+    nodes = data.get("issueLabels", {}).get("nodes", [])
+
+    labels = [
+        {
+            "id": n["id"],
+            "name": n["name"],
+            "team_key": (n.get("team") or {}).get("key"),
+            "group": (n.get("parent") or {}).get("name"),
+        }
+        for n in nodes
+    ]
+
+    if team_key:
+        labels = [
+            lb
+            for lb in labels
+            if lb["team_key"] is None or lb["team_key"].lower() == team_key.lower()
+        ]
+
+    labels.sort(key=lambda lb: (lb["team_key"] or "", lb["name"].lower()))
+    return {"labels": labels, "count": len(labels)}
+
+
 @mcp.tool()
 def get_issue(identifier: str, organization: Optional[str] = None) -> dict:
     """
@@ -578,10 +699,13 @@ def update_issue(
     description: Optional[str] = None,
     priority: Optional[int] = None,
     assignee_email: Optional[str] = None,
+    labels: Optional[list[str]] = None,
+    replace_labels: bool = False,
+    create_missing_labels: bool = False,
     organization: Optional[str] = None,
 ) -> dict:
     """
-    Update issue fields (title, description, priority, assignee).
+    Update issue fields (title, description, priority, assignee, labels).
 
     Args:
         identifier: The issue identifier (e.g., 'SRE-152')
@@ -589,6 +713,13 @@ def update_issue(
         description: New description (optional, supports markdown)
         priority: New priority 0-4 where 0=none, 1=urgent, 2=high, 3=medium, 4=low (optional)
         assignee_email: Email of user to assign (optional)
+        labels: Label names to apply (optional, case-insensitive)
+        replace_labels: Replace the issue's labels with exactly `labels`.
+            Defaults to False, which adds to whatever is already there —
+            Linear's own labelIds field replaces, so adding is done by merging
+            with the issue's current labels first.
+        create_missing_labels: Create any label that does not exist rather than
+            erroring. Defaults to False.
         organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
@@ -636,8 +767,40 @@ def update_issue(
         input_fields.append("assigneeId: $assigneeId")
         variables["assigneeId"] = users[0]["id"]
 
+    # Handle label lookup
+    if labels:
+        team = issue.get("team") or {}
+        team_id, team_key = team.get("id"), team.get("key")
+        if not team_id:
+            return {"error": f"Could not determine team for issue '{identifier}'"}
+
+        label_ids, unmatched = _resolve_label_ids(
+            labels, team_id, organization=organization, create_missing=create_missing_labels
+        )
+        if unmatched:
+            return {
+                "error": f"Label(s) not found on team '{team_key}': {unmatched}. "
+                "Call list_labels to see what exists, or pass create_missing_labels=true.",
+                "matched_count": len(label_ids),
+            }
+
+        if not replace_labels:
+            # labelIds replaces outright, so merge the existing ones back in
+            existing = [
+                lb["id"]
+                for lb in (issue.get("labels") or {}).get("nodes", [])
+                if lb.get("id")
+            ]
+            label_ids = list(dict.fromkeys(existing + label_ids))
+
+        input_fields.append("labelIds: $labelIds")
+        variables["labelIds"] = label_ids
+
     if not input_fields:
-        return {"error": "No fields to update. Provide at least one of: title, description, priority, assignee_email"}
+        return {
+            "error": "No fields to update. Provide at least one of: title, description, "
+            "priority, assignee_email, labels"
+        }
 
     # Build variable declarations
     var_decls = ["$issueId: String!"]
@@ -649,6 +812,8 @@ def update_issue(
         var_decls.append("$priority: Int!")
     if "assigneeId" in variables:
         var_decls.append("$assigneeId: String")
+    if "labelIds" in variables:
+        var_decls.append("$labelIds: [String!]")
 
     mutation = f"""
     mutation UpdateIssue({", ".join(var_decls)}) {{
@@ -668,6 +833,11 @@ def update_issue(
             name
             email
           }}
+          labels {{
+            nodes {{
+              name
+            }}
+          }}
         }}
       }}
     }}
@@ -685,6 +855,8 @@ def create_issue(
     state_name: Optional[str] = None,
     assignee_email: Optional[str] = None,
     project_name: Optional[str] = None,
+    labels: Optional[list[str]] = None,
+    create_missing_labels: bool = False,
     organization: Optional[str] = None,
 ) -> dict:
     """
@@ -698,6 +870,10 @@ def create_issue(
         state_name: Initial state name (e.g., 'Todo', 'Backlog'). Optional, uses team default if not specified.
         assignee_email: Email of user to assign (optional)
         project_name: Project name to add issue to (optional, case-insensitive match)
+        labels: Label names to apply (optional, case-insensitive). Names that do
+            not already exist cause an error listing them; see list_labels.
+        create_missing_labels: Create any label that does not exist rather than
+            erroring. Defaults to False so typos don't silently add labels.
         organization: Organization name (e.g., 'Appsumo', 'Techno87'). Optional if only one org configured.
 
     Returns:
@@ -809,6 +985,20 @@ def create_issue(
         input_fields.append("projectId: $projectId")
         variables["projectId"] = target_project["id"]
 
+    # Handle label lookup
+    if labels:
+        label_ids, unmatched = _resolve_label_ids(
+            labels, team_id, organization=organization, create_missing=create_missing_labels
+        )
+        if unmatched:
+            return {
+                "error": f"Label(s) not found on team '{team_key}': {unmatched}. "
+                "Call list_labels to see what exists, or pass create_missing_labels=true.",
+                "matched_count": len(label_ids),
+            }
+        input_fields.append("labelIds: $labelIds")
+        variables["labelIds"] = label_ids
+
     # Build variable declarations
     var_decls = ["$title: String!", "$teamId: String!"]
     if "description" in variables:
@@ -821,6 +1011,8 @@ def create_issue(
         var_decls.append("$assigneeId: String")
     if "projectId" in variables:
         var_decls.append("$projectId: String")
+    if "labelIds" in variables:
+        var_decls.append("$labelIds: [String!]")
 
     mutation = f"""
     mutation CreateIssue({", ".join(var_decls)}) {{
@@ -845,6 +1037,14 @@ def create_issue(
           team {{
             key
             name
+          }}
+          project {{
+            name
+          }}
+          labels {{
+            nodes {{
+              name
+            }}
           }}
         }}
       }}

@@ -220,6 +220,40 @@ The organization name matching is case-insensitive and flexible:
 - "Appsumo", "appsumo", "APPSUMO" all work
 - Spaces and hyphens are ignored for matching
 
+### Labels
+
+`list_labels` shows what exists; `create_issue` and `update_issue` take a
+`labels` list of names, matched case-insensitively.
+
+```python
+list_labels(team_key="KRD", organization="koard")
+
+create_issue(
+    title="Telemetry scrubbing audit",
+    team_key="KRD",
+    labels=["Security", "PCI"],
+    organization="koard",
+)
+
+# adds Security, keeping labels the issue already has
+update_issue("KRD-123", labels=["Security"], organization="koard")
+
+# replaces every label with exactly this list
+update_issue("KRD-123", labels=["Security"], replace_labels=True, organization="koard")
+```
+
+Two behaviours worth knowing:
+
+- **Unknown names are an error, not a new label.** A typo returns the list of
+  names that didn't match rather than quietly creating them. Pass
+  `create_missing_labels=True` when you do want them created.
+- **`update_issue` adds by default.** Linear's underlying `labelIds` field
+  replaces the whole set, so adding is done by merging with the issue's current
+  labels first. Use `replace_labels=True` for the raw replace.
+
+Where a team label and a workspace label share a name, the team's own label
+wins — matching what the Linear UI would apply to an issue on that team.
+
 ## Development
 
 ```bash
