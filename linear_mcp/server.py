@@ -387,6 +387,39 @@ def _resolve_label_ids(
     return ids, unmatched
 
 
+def _resolve_project_id(
+    project_name: str,
+    organization: Optional[str] = None,
+) -> tuple[Optional[str], list[str]]:
+    """
+    Map a project name to its Linear project ID (case-insensitive).
+
+    Fetches up to 250 (Linear's page cap) so a target that sorts past the
+    first page is still found — re-homing depends on matching the newest
+    projects, whose position in the default ordering is not guaranteed.
+
+    Returns:
+        (project_id, []) on a hit, or (None, available_names) when nothing
+        matches, so the caller can build an error listing what exists.
+    """
+    query = """
+    query ListProjects {
+      projects(first: 250) {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+    """
+    data = graphql_request(query, organization=organization)
+    projects = data.get("projects", {}).get("nodes", [])
+    for project in projects:
+        if project["name"].lower() == project_name.lower():
+            return project["id"], []
+    return None, [p["name"] for p in projects]
+
+
 @mcp.tool()
 def list_labels(team_key: Optional[str] = None, organization: Optional[str] = None) -> dict:
     """
@@ -699,13 +732,14 @@ def update_issue(
     description: Optional[str] = None,
     priority: Optional[int] = None,
     assignee_email: Optional[str] = None,
+    project_name: Optional[str] = None,
     labels: Optional[list[str]] = None,
     replace_labels: bool = False,
     create_missing_labels: bool = False,
     organization: Optional[str] = None,
 ) -> dict:
     """
-    Update issue fields (title, description, priority, assignee, labels).
+    Update issue fields (title, description, priority, assignee, project, labels).
 
     Args:
         identifier: The issue identifier (e.g., 'SRE-152')
@@ -713,6 +747,10 @@ def update_issue(
         description: New description (optional, supports markdown)
         priority: New priority 0-4 where 0=none, 1=urgent, 2=high, 3=medium, 4=low (optional)
         assignee_email: Email of user to assign (optional)
+        project_name: Move the issue into this project (optional, case-insensitive
+            match). Unlike labels this replaces the issue's project, since an issue
+            belongs to at most one — pass the empty string to remove it from its
+            project entirely.
         labels: Label names to apply (optional, case-insensitive)
         replace_labels: Replace the issue's labels with exactly `labels`.
             Defaults to False, which adds to whatever is already there —
@@ -767,6 +805,19 @@ def update_issue(
         input_fields.append("assigneeId: $assigneeId")
         variables["assigneeId"] = users[0]["id"]
 
+    # Handle project lookup. An issue belongs to at most one project, so this
+    # replaces rather than merges; the empty string clears it (projectId: null).
+    if project_name is not None:
+        if project_name.strip() == "":
+            input_fields.append("projectId: $projectId")
+            variables["projectId"] = None
+        else:
+            project_id, available = _resolve_project_id(project_name, organization=organization)
+            if project_id is None:
+                return {"error": f"Project '{project_name}' not found. Available projects: {available}"}
+            input_fields.append("projectId: $projectId")
+            variables["projectId"] = project_id
+
     # Handle label lookup
     if labels:
         team = issue.get("team") or {}
@@ -799,7 +850,7 @@ def update_issue(
     if not input_fields:
         return {
             "error": "No fields to update. Provide at least one of: title, description, "
-            "priority, assignee_email, labels"
+            "priority, assignee_email, project_name, labels"
         }
 
     # Build variable declarations
@@ -812,6 +863,8 @@ def update_issue(
         var_decls.append("$priority: Int!")
     if "assigneeId" in variables:
         var_decls.append("$assigneeId: String")
+    if "projectId" in variables:
+        var_decls.append("$projectId: String")
     if "labelIds" in variables:
         var_decls.append("$labelIds: [String!]")
 
@@ -832,6 +885,10 @@ def update_issue(
           assignee {{
             name
             email
+          }}
+          project {{
+            id
+            name
           }}
           labels {{
             nodes {{
@@ -962,28 +1019,11 @@ def create_issue(
 
     # Handle project lookup
     if project_name is not None:
-        projects_query = """
-        query ListProjects {
-          projects(first: 50) {
-            nodes {
-              id
-              name
-            }
-          }
-        }
-        """
-        projects_data = graphql_request(projects_query, organization=organization)
-        projects = projects_data.get("projects", {}).get("nodes", [])
-        target_project = None
-        for project in projects:
-            if project["name"].lower() == project_name.lower():
-                target_project = project
-                break
-        if not target_project:
-            available = [p["name"] for p in projects]
+        project_id, available = _resolve_project_id(project_name, organization=organization)
+        if project_id is None:
             return {"error": f"Project '{project_name}' not found. Available projects: {available}"}
         input_fields.append("projectId: $projectId")
-        variables["projectId"] = target_project["id"]
+        variables["projectId"] = project_id
 
     # Handle label lookup
     if labels:
