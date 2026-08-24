@@ -13,7 +13,20 @@ A simple MCP (Model Context Protocol) server for Linear issue management.
 - **update_issue(identifier, title, description, priority, assignee_email, organization)** - Update issue fields
 - **add_comment(identifier, body, organization)** - Add a comment to an issue
 
-All tools support an optional `organization` parameter. If you have only one organization configured or want to use the default, you can omit this parameter.
+All tools take an `organization` parameter.
+
+**It is optional only when the target is unambiguous** — i.e. you configured a single
+`LINEAR_API_KEY`, or exactly one `LINEAR_API_KEY_ORGNAME`. **When several organizations are
+configured you must name one**, and a call that omits it fails with an error listing the
+choices.
+
+That is deliberate. The server used to fall back to the first key in alphabetical order, so a
+write meant for one workspace could land in another's — successfully, with nothing in the
+response to show where it went. Guessing a tenant is worse than failing, so it now fails.
+
+Write tools (`create_issue`, `update_issue`, `update_issue_status`, `add_comment`,
+`create_project`) also echo the resolved workspace back as `organization` in their result, so a
+mis-targeted write is visible rather than silent.
 
 ## Installation
 
@@ -69,6 +82,17 @@ To work with multiple Linear organizations, use organization-specific environmen
 ```
 
 The organization name is extracted from the environment variable name (e.g., `LINEAR_API_KEY_APPSUMO` → organization name: "appsumo").
+
+With more than one organization configured, every call must name its target:
+
+```python
+create_issue(title="...", team_key="ENG", organization="koard")   # explicit -> fine
+create_issue(title="...", team_key="ENG")                          # raises ValueError
+```
+
+A partial name resolves only when it matches exactly one organization (`"appsumo"` →
+`appsumo-production`); a prefix matching several (`"acme"` → `acme-prod`, `acme-staging`) is an
+error rather than a coin flip.
 
 You can also mix both formats:
 

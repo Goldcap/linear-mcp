@@ -139,18 +139,33 @@ def get_available_organizations() -> dict[str, str]:
     return orgs
 
 
-def get_api_key(organization: Optional[str] = None) -> str:
-    """
-    Get Linear API key for a specific organization.
+def _normalize_org(name: str) -> str:
+    """Canonical form used for org-name matching."""
+    return name.lower().replace(" ", "").replace("-", "")
 
-    Args:
-        organization: Organization name (case-insensitive). If None, uses default.
+
+def resolve_organization(organization: Optional[str] = None) -> str:
+    """
+    Resolve a caller-supplied organization to exactly one configured org name.
+
+    This is the single place org selection happens, so key lookup and the name
+    reported back to the caller can never disagree.
+
+    Selection rules:
+      * An explicit name wins: exact match first, then a unique partial match.
+      * A partial match that hits more than one configured org is an ERROR, not a
+        coin flip.
+      * With no name supplied: use "default" (a bare LINEAR_API_KEY) if present,
+        else the single configured org if there is exactly one.
+      * With no name supplied and several orgs configured, raise. Silently picking
+        one writes another tenant's data into the wrong workspace, and the caller
+        gets a success response either way.
 
     Returns:
-        API key for the specified organization
+        The configured organization name (a key of get_available_organizations()).
 
     Raises:
-        ValueError: If no API keys configured or organization not found
+        ValueError: nothing configured, ambiguous, or unresolvable.
     """
     orgs = get_available_organizations()
 
@@ -161,36 +176,76 @@ def get_api_key(organization: Optional[str] = None) -> str:
             f"or store it in the OS keyring under service '{KEYRING_SERVICE}'"
         )
 
-    # If no organization specified, use default or first available
+    named = sorted(name for name in orgs if name != "default")
+
     if not organization:
         if "default" in orgs:
-            return orgs["default"]
-        # Return first available organization
-        return next(iter(orgs.values()))
+            return "default"
+        if len(orgs) == 1:
+            return next(iter(orgs))
+        raise ValueError(
+            "Multiple Linear organizations are configured "
+            f"({', '.join(named)}) and no `organization` was given. "
+            "Pass `organization` explicitly -- refusing to guess, because writing to "
+            "the wrong workspace succeeds silently and puts one tenant's issues in "
+            "another's tracker."
+        )
 
-    # Normalize organization name for matching
-    org_normalized = organization.lower().replace(" ", "").replace("-", "")
+    org_normalized = _normalize_org(organization)
 
-    # Try exact match first
     if org_normalized in orgs:
-        return orgs[org_normalized]
+        return org_normalized
 
-    # Try partial match (e.g., "appsumo" matches "appsumo-production")
-    for org_key, api_key in orgs.items():
-        org_key_normalized = org_key.replace(" ", "").replace("-", "")
-        if org_normalized in org_key_normalized or org_key_normalized in org_normalized:
-            return api_key
+    # Unique partial match only (e.g. "appsumo" -> "appsumo-production").
+    matches = [
+        name
+        for name in orgs
+        if org_normalized in _normalize_org(name) or _normalize_org(name) in org_normalized
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Organization '{organization}' is ambiguous -- it matches "
+            f"{', '.join(sorted(matches))}. Use the exact organization name."
+        )
 
-    # No match found
-    available = [name for name in orgs.keys() if name != "default"]
-    if available:
+    if named:
         raise ValueError(
-            f"Organization '{organization}' not found. Available organizations: {', '.join(available)}"
+            f"Organization '{organization}' not found. Available organizations: {', '.join(named)}"
         )
-    else:
-        raise ValueError(
-            f"Organization '{organization}' not found. Only default organization is configured."
-        )
+    raise ValueError(
+        f"Organization '{organization}' not found. Only default organization is configured."
+    )
+
+
+def get_api_key(organization: Optional[str] = None) -> str:
+    """
+    Get Linear API key for a specific organization.
+
+    Args:
+        organization: Organization name (case-insensitive). Required when more than
+            one organization is configured -- see resolve_organization().
+
+    Returns:
+        API key for the specified organization
+
+    Raises:
+        ValueError: If no API keys configured, or the organization is unresolvable
+            or ambiguous.
+    """
+    return get_available_organizations()[resolve_organization(organization)]
+
+
+def _with_org(payload: dict, organization: Optional[str] = None) -> dict:
+    """Stamp a write result with the workspace it actually landed in.
+
+    Without this a mis-targeted write is invisible: the mutation succeeds, the tool
+    reports success, and nothing in the response says which workspace it hit.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    return {**payload, "organization": resolve_organization(organization)}
 
 
 def graphql_request(query: str, variables: Optional[dict] = None, organization: Optional[str] = None) -> dict:
@@ -683,7 +738,7 @@ def update_issue_status(identifier: str, state_name: str, organization: Optional
     }
     """
     result = graphql_request(mutation, {"issueId": issue_id, "stateId": target_state["id"]}, organization=organization)
-    return result.get("issueUpdate", {})
+    return _with_org(result.get("issueUpdate", {}), organization)
 
 
 @mcp.tool()
@@ -722,7 +777,7 @@ def add_comment(identifier: str, body: str, organization: Optional[str] = None) 
     }
     """
     result = graphql_request(mutation, {"issueId": issue_id, "body": body}, organization=organization)
-    return result.get("commentCreate", {})
+    return _with_org(result.get("commentCreate", {}), organization)
 
 
 @mcp.tool()
@@ -900,7 +955,7 @@ def update_issue(
     }}
     """
     result = graphql_request(mutation, variables, organization=organization)
-    return result.get("issueUpdate", {})
+    return _with_org(result.get("issueUpdate", {}), organization)
 
 
 @mcp.tool()
@@ -1091,7 +1146,7 @@ def create_issue(
     }}
     """
     result = graphql_request(mutation, variables, organization=organization)
-    return result.get("issueCreate", {})
+    return _with_org(result.get("issueCreate", {}), organization)
 
 
 @mcp.tool()
@@ -1169,7 +1224,7 @@ def create_project(
     }}
     """
     result = graphql_request(mutation, variables, organization=organization)
-    return result.get("projectCreate", {})
+    return _with_org(result.get("projectCreate", {}), organization)
 
 
 @mcp.tool()
