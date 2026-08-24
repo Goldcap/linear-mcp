@@ -287,6 +287,25 @@ pip install -e .
 LINEAR_API_KEY=lin_api_xxx linear-mcp
 ```
 
+### ⚠️ Bump the version when you change the code
+
+If your MCP client launches this server with `uvx --from /path/to/linear-mcp linear-mcp`,
+**uv caches the built wheel against the path and the version in `pyproject.toml`.** Pulling
+new code does not invalidate that cache. Neither does `uvx --reinstall`, and
+`uv cache clean linear-mcp` is slow enough to be impractical mid-session.
+
+The failure is silent and easy to misread: the server starts, reports the right
+organizations at startup, and answers tool calls — using the *old* code. It looks like a
+working server, so a fix appears to have simply not worked.
+
+So: **bump `version` in `pyproject.toml` in the same commit as any behaviour change.**
+
+Alternatively, launch it from the working tree instead, which never caches:
+
+```json
+{ "command": "uv", "args": ["run", "--directory", "/path/to/linear-mcp", "linear-mcp"] }
+```
+
 ## License
 
 MIT
